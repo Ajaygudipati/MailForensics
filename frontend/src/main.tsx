@@ -1,0 +1,2 @@
+import { StrictMode } from 'react'; import { createRoot } from 'react-dom/client'; import App from './AppShell'; import './styles.css'; import './additions.css'; import './forensics.css'; import './polish.css'; import './flow.css'; import './authentication.css'; import './priority.css'; import './smtp-flow.css'; import './domain.css'; import './investigation-motion.css'; import './relationship.css'; import './message-type.css';
+createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
