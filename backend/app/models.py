@@ -5,6 +5,8 @@ class AnalysisResponse(BaseModel):
     id: str
     email_metadata: dict[str, Any]
     classification: str
+    categories: list[str]
+    confidence: float
     message_category: dict[str, Any]
     domain_relationship: dict[str, Any]
     verdict_explanation: str

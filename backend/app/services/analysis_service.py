@@ -12,11 +12,40 @@ IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 SUSPICIOUS_TLDS = {"zip", "top", "xyz", "click", "gq", "work", "country", "icu", "sbs"}
 SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "rb.gy", "is.gd"}
 KEYWORDS = {
-    "urgent": ("Urgency language", "urgent|immediately|action required|within 24 hours"),
-    "credential": ("Credential harvesting language", "password|verify your account|sign in|login|mfa|credentials"),
-    "financial": ("Financial request", "invoice|payment|wire transfer|bank account|gift card"),
-    "threat": ("Fear or account threat", "suspended|locked|termination|security alert|unusual activity"),
+    "urgent": ("Urgency language", "urgent|immediately|action required|within 24 hours|asap|today only"),
+    "credential": ("Credential harvesting language", "password|verify your account|sign in|login|mfa|credentials|security code|otp|one[- ]time passcode|reset your password|update your password"),
+    "financial": ("Financial request", "invoice|payment|wire transfer|bank account|gift card|refund|transfer money|card details|cvv|debit card"),
+    "threat": ("Fear or account threat", "suspended|locked|termination|security alert|unusual activity|account compromised|unauthorized login|restricted"),
 }
+
+KNOWN_BRANDS = {
+    "microsoft": {"domains": {"microsoft.com", "office.com", "outlook.com", "live.com", "xbox.com"}},
+    "netflix": {"domains": {"netflix.com"}},
+    "paypal": {"domains": {"paypal.com"}},
+    "google": {"domains": {"google.com", "gmail.com"}},
+    "apple": {"domains": {"apple.com", "icloud.com"}},
+    "amazon": {"domains": {"amazon.com"}},
+    "dropbox": {"domains": {"dropbox.com"}},
+    "linkedin": {"domains": {"linkedin.com"}},
+    "adobe": {"domains": {"adobe.com"}},
+}
+
+PHISHING_HINTS = (
+    "password reset",
+    "verify your password",
+    "mfa code",
+    "security code",
+    "account suspended",
+    "suspended due to unusual activity",
+    "update your payment",
+    "bank account update",
+    "invoice payment failed",
+    "verify credentials",
+    "confirm your identity",
+    "login now",
+    "action required",
+    "immediately",
+)
 
 # A small public-suffix safeguard for common multi-label registrations.  A
 # production deployment should replace this with the Public Suffix List.
@@ -160,12 +189,88 @@ def _attachments(msg):
         items.append({"name": filename, "mime_type": part.get_content_type(), "size": len(payload), "extension": ext or "None", "sha256": hashlib.sha256(payload).hexdigest(), "sha1": hashlib.sha1(payload).hexdigest(), "md5": hashlib.md5(payload).hexdigest(), "risk_score": 75 if signals else 0, "signals": signals, "reputation": "Unknown / no intelligence available"})
     return items
 
-def _classification(score, findings, urls, attachments):
+def _extract_brand_mentions(subject: str, body: str):
+    text = f"{subject}\n{body}".lower()
+    hits = []
+    for brand in KNOWN_BRANDS:
+        if brand in text:
+            hits.append(brand)
+    return hits
+
+
+def _looks_like_brand_impersonation(sender_domain: str, subject: str, body: str, urls: list[dict]):
+    sender = (sender_domain or "").lower()
+    text = f"{subject}\n{body}".lower()
+    for brand, meta in KNOWN_BRANDS.items():
+        brand_domains = meta["domains"]
+        if any(brand_domain in sender for brand_domain in brand_domains):
+            return False
+        if brand in text and not any(domain in sender for domain in brand_domains):
+            return True
+    for url in urls:
+        host = (url.get("host") or "").lower()
+        for brand, meta in KNOWN_BRANDS.items():
+            if brand in host:
+                continue
+            if brand in (subject + " " + body).lower() and url.get("risk_score", 0) >= 50:
+                return True
+    return False
+
+
+def _classification_categories(score, findings, urls, attachments, sender_domain, subject, body):
+    text = f"{subject}\n{body}".lower()
+    categories = []
+
+    if any(title in {"Brand impersonation risk", "Sender identity mismatch"} for title in [f["title"] for f in findings]):
+        categories.append("BRAND_IMPERSONATION")
+    if any(keyword in text for keyword in ["password", "mfa", "otp", "verify your account", "security code", "verification code", "update your password", "login now"]):
+        categories.append("CREDENTIAL_PHISHING")
+    if any(keyword in text for keyword in ["payment failed", "update your payment", "bank account", "wire transfer", "invoice payment failed", "gift card", "refund"]):
+        categories.append("PAYMENT_PHISHING")
+    if any(keyword in text for keyword in ["suspended", "security alert", "unusual activity", "account compromised", "locked", "unauthorized login"]):
+        categories.append("ACCOUNT_COMPROMISE")
+    if any(a.get("signals") for a in attachments):
+        categories.append("MALWARE")
+    if any(u.get("risk_score", 0) >= 50 for u in urls):
+        categories.append("SUSPICIOUS_URL")
+    if any(keyword in text for keyword in ["newsletter", "unsubscribe", "special offer", "limited time offer", "promotional", "bulk", "advertising"]):
+        categories.append("SPAM")
+    if any(keyword in text for keyword in ["keep this confidential", "urgent", "make a payment", "bank account change", "gift card", "vendor", "payroll", "invoice fraud"]):
+        categories.append("BEC")
+
+    if not categories:
+        if score >= 60:
+            categories.append("SUSPICIOUS")
+        elif score >= 25:
+            categories.append("SPAM")
+        else:
+            categories.append("LEGITIMATE")
+
+    return list(dict.fromkeys(categories))
+
+
+def _classification(score, findings, urls, attachments, sender_domain, subject, body):
     severe = {f["title"] for f in findings if f["severity"] in {"HIGH", "CRITICAL"}}
-    if score >= 80 and (urls or attachments): return "MALICIOUS"
-    if score >= 60 and ("Authentication failure" in severe or "Sender identity mismatch" in severe or urls): return "PHISHING"
-    if score >= 50: return "SUSPICIOUS"
-    if score >= 25: return "SPAM"
+    text = f"{subject}\n{body}".lower()
+    phishing_signal = any(hint in text for hint in PHISHING_HINTS)
+    brand_impersonation = _looks_like_brand_impersonation(sender_domain, subject, body, urls)
+    risky_urls = any(u.get("risk_score", 0) >= 50 for u in urls)
+    suspicious_sender = bool(sender_domain) and not any(domain in sender_domain.lower() for brand in KNOWN_BRANDS for domain in KNOWN_BRANDS[brand]["domains"]) and (brand_impersonation or phishing_signal)
+
+    if "Credential harvesting intent" in severe or "Brand impersonation risk" in severe or "Financial-pressure narrative" in severe:
+        return "PHISHING"
+    if suspicious_sender or brand_impersonation:
+        return "PHISHING"
+    if score >= 80 and (urls or attachments):
+        return "PHISHING"
+    if score >= 60 and ("Authentication failure" in severe or "Sender identity mismatch" in severe or risky_urls):
+        return "PHISHING"
+    if score >= 45 and (phishing_signal or risky_urls):
+        return "PHISHING"
+    if score >= 50:
+        return "SUSPICIOUS"
+    if score >= 25:
+        return "SPAM"
     return "LEGITIMATE" if score < 25 else "UNKNOWN"
 
 def analyze_email(raw: bytes, filename: str):
@@ -206,14 +311,23 @@ def analyze_email(raw: bytes, filename: str):
         if a["signals"]: finding("HIGH", "Risky attachment", "; ".join(a["signals"]), a["name"], "Do not open the attachment outside a sandbox.")
     keyword_hits=[]
     normalized_body=body.lower()
+    threat_score = 0
     for key, (label, pattern) in KEYWORDS.items():
         hit = re.search(pattern, normalized_body)
         if hit:
             keyword_hits.append(label)
-            # Common words such as 'payment' or 'password' are not evidence of
-            # maliciousness by themselves. Preserve them as contextual findings;
-            # only pressure-oriented language contributes to the risk score.
+            if key in {"urgent", "threat", "credential", "financial"}:
+                threat_score += 8 if key in {"credential", "financial"} else 5
             finding("MEDIUM" if key in {"urgent", "threat"} else "INFO", label, "Language associated with this message type was detected; interpret it alongside independent technical signals.", hit.group(0), "Slow down and validate unexpected requests through a trusted channel.")
+    if _looks_like_brand_impersonation(sender_domain, subject, body, urls):
+        threat_score += 18
+        finding("HIGH", "Brand impersonation risk", "The email references a known brand but the sender and destination context do not align with that brand's legitimate infrastructure.", f"Brand mentions: {', '.join(_extract_brand_mentions(subject, body))}; sender domain: {sender_domain}", "Verify the sender through a trusted official channel and do not click account-related links.")
+    if any(hint in normalized_body for hint in ["password", "mfa", "otp", "verification code", "security code", "update your password", "verify your account", "login now"]):
+        threat_score += 12
+        finding("HIGH", "Credential harvesting intent", "The message is actively trying to get a password, MFA code, OTP, or other credentials.", "Credentials requested in the subject or body", "Do not provide any credentials or codes to unverified senders.")
+    if any(hint in normalized_body for hint in ["payment failed", "update your payment", "wire transfer", "refund", "bank account", "gift card"]):
+        threat_score += 10
+        finding("HIGH", "Financial-pressure narrative", "The email attempts to create urgency around a financial action or payment problem.", "Account or payment action requested", "Verify payment requests through a known official channel before responding.")
     if "<script" in body.lower() or "javascript:" in body.lower(): finding("HIGH", "Active content in HTML", "HTML contains JavaScript-like active content.", "script/javascript URI detected", "Do not render this HTML outside a sandbox.")
     received_chain = _received_chain(msg)
     received_ips = list(dict.fromkeys(ip for ip in IP_RE.findall(raw_headers) if _is_public_ip(ip)))
@@ -225,11 +339,28 @@ def analyze_email(raw: bytes, filename: str):
     category("Spoofing",15, 13 if reply_domain and sender_domain and domain_relationship["verdict"] == "UNEXPLAINED_MISMATCH" else 0)
     category("URLs",20,min(20,sum(7 for u in urls if u["signals"])))
     category("Attachments",10,min(10,sum(8 for a in attachments if a["signals"])))
-    category("Content",10,min(10,sum(3 for key in KEYWORDS if key in {"urgent", "threat"} and any(KEYWORDS[key][0] == hit for hit in keyword_hits))))
+    category("Content",15, min(15, threat_score))
     category("Infrastructure",10,3 if received_ips else 0)
     category("Threat Intelligence",10,0)
     score=min(100,sum(x["score"] for x in score_breakdown))
-    classification=_classification(score, findings, urls, attachments)
+
+    phishing_boost = 0
+    if any(hint in normalized_body for hint in ["password", "mfa", "otp", "verification code", "security code", "update your password", "verify your account", "login now"]):
+        phishing_boost += 25
+    if "Brand impersonation risk" in {f["title"] for f in findings}:
+        phishing_boost += 20
+    if "Financial-pressure narrative" in {f["title"] for f in findings}:
+        phishing_boost += 15
+    if "Credential harvesting intent" in {f["title"] for f in findings}:
+        phishing_boost += 20
+    if "Sender identity mismatch" in {f["title"] for f in findings}:
+        phishing_boost += 15
+    if any(key in {"urgent", "threat", "credential", "financial"} for key in ["urgent", "threat", "credential", "financial"] if re.search(KEYWORDS[key][1], normalized_body, re.I)):
+        phishing_boost += 10
+    score = min(100, score + phishing_boost)
+    classification=_classification(score, findings, urls, attachments, sender_domain, subject, body)
+    categories = _classification_categories(score, findings, urls, attachments, sender_domain, subject, body)
+    confidence = round(min(0.99, max(0.1, 0.35 + (score / 100) * 0.55 + (len(categories) * 0.03))), 2)
     level = "Very Low" if score<20 else "Low" if score<40 else "Medium" if score<60 else "High" if score<80 else "Critical"
     domains=list(dict.fromkeys(filter(None,[sender_domain,reply_domain]+[u["domain"] for u in urls])))
     domain_data=[]
@@ -244,4 +375,4 @@ def analyze_email(raw: bytes, filename: str):
     all_addresses=[a for _,a in getaddresses([sender,recipient,reply_to,return_path])]
     timeline=[{"time":datetime.now(timezone.utc).strftime("%H:%M:%S"),"event":"Sample parsed in memory"},{"time":"+00:01","event":"Headers, MIME parts, URLs and attachments extracted"},{"time":"+00:02","event":"Authentication and weighted risk engine completed"},{"time":"+00:02","event":f"Classification: {classification}"}]
     explanation = f"This email is classified as {classification}. " + (findings[0]["description"] if findings else "No high-confidence suspicious signals were identified from the available message data.")
-    return {"id":str(uuid.uuid4()),"email_metadata":{"filename":filename,"subject":subject,"sender":sender or "Unknown","recipient":recipient or "Unknown","date":_header(msg,"Date") or "Unknown","reply_to":reply_to or "Not set","return_path":return_path or "Not set","message_id":_header(msg,"Message-ID") or "Not set","size":len(raw),"mime_type":msg.get_content_type(),"url_count":len(urls),"attachment_count":len(attachments),"sender_domain":sender_domain or "Unknown","sending_ip":received_ips[0] if received_ips else "Unknown"},"classification":classification,"message_category":message_category,"domain_relationship":domain_relationship,"verdict_explanation":explanation,"risk_score":score,"risk_level":level,"score_breakdown":score_breakdown,"authentication":auth,"headers":headers,"received_chain":received_chain,"domains":domain_data,"ips":ips,"urls":urls,"attachments":attachments,"content_analysis":{"social_engineering_indicators":keyword_hits,"html_detected":bool(html),"javascript_detected":"<script" in body.lower() or "javascript:" in body.lower(),"tracking_pixels":len(re.findall(r"<img[^>]+(?:width=[\"']?1|height=[\"']?1)", body, re.I)),"preview_text":_safe_html("\n".join(plain)[:3000])},"threat_intelligence":{"status":"No external intelligence provider configured","note":"Missing API data is not treated as clean."},"findings":findings,"indicators":{"emails":list(dict.fromkeys(all_addresses)),"domains":domains,"ips":received_ips,"urls":[u["normalized"] for u in urls],"hashes":[a["sha256"] for a in attachments],"message_ids":[_header(msg,"Message-ID")] if _header(msg,"Message-ID") else []},"recommendations":[f["recommendation"] for f in findings if f["severity"] != "INFO"] or ["No immediate action. Retain the original sample if further verification is needed."],"timeline":timeline,"raw_headers":raw_headers,"html_preview":None}
+    return {"id":str(uuid.uuid4()),"email_metadata":{"filename":filename,"subject":subject,"sender":sender or "Unknown","recipient":recipient or "Unknown","date":_header(msg,"Date") or "Unknown","reply_to":reply_to or "Not set","return_path":return_path or "Not set","message_id":_header(msg,"Message-ID") or "Not set","size":len(raw),"mime_type":msg.get_content_type(),"url_count":len(urls),"attachment_count":len(attachments),"sender_domain":sender_domain or "Unknown","sending_ip":received_ips[0] if received_ips else "Unknown"},"classification":classification,"categories":categories,"confidence":confidence,"message_category":message_category,"domain_relationship":domain_relationship,"verdict_explanation":explanation,"risk_score":score,"risk_level":level,"score_breakdown":score_breakdown,"authentication":auth,"headers":headers,"received_chain":received_chain,"domains":domain_data,"ips":ips,"urls":urls,"attachments":attachments,"content_analysis":{"social_engineering_indicators":keyword_hits,"html_detected":bool(html),"javascript_detected":"<script" in body.lower() or "javascript:" in body.lower(),"tracking_pixels":len(re.findall(r"<img[^>]+(?:width=[\"']?1|height=[\"']?1)", body, re.I)),"preview_text":_safe_html("\n".join(plain)[:3000])},"threat_intelligence":{"status":"No external intelligence provider configured","note":"Missing API data is not treated as clean."},"findings":findings,"indicators":{"emails":list(dict.fromkeys(all_addresses)),"domains":domains,"ips":received_ips,"urls":[u["normalized"] for u in urls],"hashes":[a["sha256"] for a in attachments],"message_ids":[_header(msg,"Message-ID")] if _header(msg,"Message-ID") else []},"recommendations":[f["recommendation"] for f in findings if f["severity"] != "INFO"] or ["No immediate action. Retain the original sample if further verification is needed."],"timeline":timeline,"raw_headers":raw_headers,"html_preview":None}
