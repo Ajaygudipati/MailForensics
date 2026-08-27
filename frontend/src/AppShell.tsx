@@ -432,6 +432,14 @@ function Overview({
       (domain: AnyRecord) =>
         domain.domain === analysis.email_metadata?.sender_domain,
     ) || {};
+  const senderDomainName = analysis.email_metadata?.sender_domain || "";
+  const hasSenderDomain = /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(senderDomainName);
+  const whoisUrl = hasSenderDomain
+    ? `https://www.whois.com/whois/${encodeURIComponent(senderDomainName)}`
+    : "#";
+  const authenticationCheckUrl = hasSenderDomain
+    ? `https://dmarcian.com/domain-checker/?domain=${encodeURIComponent(senderDomainName)}`
+    : "#";
   const whois = senderDomain.whois?.response?.data || {};
   return (
     <>
@@ -506,12 +514,24 @@ function Overview({
               ),
             )}
           </div>
-          <button
-            className="link-button"
-            onClick={() => onTab("Authentication")}
-          >
-            Inspect authentication <ArrowUpRight size={14} />
-          </button>
+          <div className="auth-check-links">
+            {hasSenderDomain ? (
+              <>
+                <a
+                  className="link-button external-check-link"
+                  href={authenticationCheckUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={`Check SPF, DKIM, and DMARC for ${senderDomainName} with dmarcian`}
+                >
+                  <img className="provider-logo" src="https://www.google.com/s2/favicons?domain=dmarcian.com&sz=32" alt="dmarcian logo" />
+                  dmarcian <ArrowUpRight size={14} />
+                </a>
+              </>
+            ) : (
+              <span className="link-button link-disabled">Authentication lookup unavailable</span>
+            )}
+          </div>
         </Glass>
         <Glass className="sender-domain-card">
           <SectionTitle eyebrow="SENDER INTELLIGENCE" title="Sender domain" />
@@ -570,9 +590,21 @@ function Overview({
             <b>{analysis.domain_relationship?.verdict?.replaceAll("_", " ") || "NOT ASSESSED"}</b>
             <small>{analysis.domain_relationship?.explanation || "No relationship explanation available."}</small>
           </div>
-          <button className="link-button" onClick={() => onTab("Domains")}>
-            Inspect domain evidence <ArrowUpRight size={14} />
-          </button>
+          {hasSenderDomain ? (
+            <a
+              className="link-button domain-whois-link"
+              href={whoisUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={`Open WHOIS lookup for ${senderDomainName}`}
+            >
+              Open WHOIS lookup <ArrowUpRight size={14} />
+            </a>
+          ) : (
+            <span className="link-button link-disabled">
+              WHOIS unavailable <ArrowUpRight size={14} />
+            </span>
+          )}
         </Glass>
       </div>
     </>
@@ -827,6 +859,35 @@ function SignalDetails({ analysis }: { analysis: Analysis }) {
   );
 }
 
+function EmailPreview({ analysis }: { analysis: Analysis }) {
+  const preview = analysis.html_preview;
+  const metadata = analysis.email_metadata || {};
+  return (
+    <Glass className="email-preview-panel">
+      <SectionTitle
+        eyebrow="MESSAGE VIEW"
+        title="Inbox view"
+        count={preview ? "RENDERED" : "EMPTY"}
+      />
+      <div className="email-preview-meta">
+        <div><span>From</span><b>{metadata.sender || "Unknown sender"}</b></div>
+        <div><span>To</span><b>{metadata.recipient || "Unknown recipient"}</b></div>
+        <div><span>Subject</span><b>{metadata.subject || "(No subject)"}</b></div>
+      </div>
+      {preview ? (
+        <iframe
+          className="email-preview-frame"
+          title="Sanitized rendered email preview"
+          sandbox=""
+          srcDoc={preview}
+        />
+      ) : (
+        <div className="email-preview-fallback">No readable email body available.</div>
+      )}
+    </Glass>
+  );
+}
+
 const priorityTabs = [
   "Verdict",
   "Findings",
@@ -834,6 +895,7 @@ const priorityTabs = [
   "Mail Flow",
   "Headers",
   "Content",
+  "Email Preview",
   "Infrastructure",
   "Raw Email",
 ];
@@ -853,6 +915,7 @@ function Report({
       "Mail Flow": ".flow-panel",
       Headers: ".header-forensics",
       Content: ".signal-grid",
+      "Email Preview": ".email-preview-panel",
       Infrastructure: ".report-grid",
       "Raw Email": ".raw-panel",
     };
@@ -908,6 +971,7 @@ function Report({
           <Overview analysis={analysis} onTab={() => undefined} />
           <HeaderForensics analysis={analysis} />
           <SignalDetails analysis={analysis} />
+          <EmailPreview analysis={analysis} />
           <div className="report-divider">
             <span>DEEP FORENSICS</span>
           </div>

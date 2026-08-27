@@ -1,3 +1,4 @@
+import base64
 from email.message import EmailMessage
 
 from app.services.analysis_service import analyze_email
@@ -37,6 +38,8 @@ def test_legitimate_transactional_email_stays_legitimate():
 
     assert result["classification"] == "LEGITIMATE"
     assert result["risk_score"] < 40
+    sender_domain = next(domain for domain in result["domains"] if domain["domain"] == "microsoft.com")
+    assert sender_domain["reliability"] == "High"
 
 
 def test_legitimate_branded_transaction_from_brand_domain_is_not_phishing():
@@ -63,6 +66,8 @@ def test_branded_transaction_from_other_domain_is_phishing():
 
     assert result["classification"] == "PHISHING"
     assert result["risk_score"] >= 60
+    sender_domain = next(domain for domain in result["domains"] if domain["domain"] == "netflix-payment-alert.com")
+    assert sender_domain["reliability"] == "Low"
 
 
 def test_promotion_email_with_brand_mention_is_not_phishing_by_default():
@@ -161,3 +166,107 @@ def test_authentication_failure_and_call_target_escalate_sparse_message():
 
     assert result["classification"] == "PHISHING"
     assert "VISHING" in result["categories"]
+
+
+def test_mcafee_subscription_call_scam_is_phishing():
+    raw = make_email(
+        "McAfee subscription renewal notice",
+        "McAfee Billing <billing@support-renewal.example>",
+        "Your McAfee antivirus subscription has expired. Call +1-888-555-0147 immediately to renew and avoid losing protection.",
+    )
+
+    result = analyze_email(raw, "mcafee-vishing.eml")
+
+    assert result["classification"] == "PHISHING"
+    assert "VISHING" in result["categories"]
+    assert "support-renewal.example" in result["indicators"]["domains"]
+
+
+def test_crypto_wallet_call_scam_with_external_link_is_phishing():
+    raw = make_email(
+        "Urgent Coinbase wallet security call",
+        "Coinbase Security <security@coinbase-help.example>",
+        "Your crypto wallet transaction is on hold. Call 1 800 555 0188 now to secure your account and recover your funds at https://coinbase-verify.example/secure.",
+    )
+
+    result = analyze_email(raw, "crypto-vishing.eml")
+
+    assert result["classification"] == "PHISHING"
+    assert "VISHING" in result["categories"]
+    assert any(f["title"] == "Voice-phishing (vishing) risk" for f in result["findings"])
+
+
+def test_spanish_single_word_alert_subject_is_phishing():
+    raw = make_email(
+        "¡Atención!: Bloqueo...",
+        "Centro de seguridad <notice@account-review.example>",
+        "Su acceso será bloqueado. Revise el mensaje para recuperar el acceso.",
+    )
+
+    result = analyze_email(raw, "spanish-alert-subject.eml")
+
+    assert result["classification"] == "PHISHING"
+    assert any(f["title"] == "Foreign-language phishing subject" for f in result["findings"])
+
+
+def test_foreign_language_normal_subject_is_not_phishing_from_subject_alone():
+    raw = make_email(
+        "Oferta especial de verano",
+        "Noticias <offers@newsletter.example>",
+        "Descubre nuestras novedades y descuentos de temporada.",
+    )
+
+    result = analyze_email(raw, "spanish-normal-subject.eml")
+
+    assert result["classification"] != "PHISHING"
+
+
+def test_clean_senate_gov_marketing_message_is_legitimate_not_spam():
+    message = EmailMessage()
+    message["Subject"] = "Senator Moody's constituent newsletter"
+    message["From"] = "Senator Moody <newsletter@moody.senate.gov>"
+    message["To"] = "user@example.com"
+    message["Date"] = "Mon, 01 Jan 2024 12:00:00 +0000"
+    message["List-Unsubscribe"] = "<mailto:unsubscribe@moody.senate.gov>"
+    message.set_content("Read this month's constituent update, committee news, and public service information from Senator Moody's office.")
+
+    result = analyze_email(message.as_bytes(), "moody-newsletter.eml")
+
+    assert result["classification"] == "LEGITIMATE"
+    assert "MARKETING" in result["categories"]
+    assert "SPAM" not in result["categories"]
+
+
+def test_html_preview_sanitizes_active_content_and_embeds_inline_images():
+    message = EmailMessage()
+    message["Subject"] = "Visual receipt"
+    message["From"] = "Store <receipts@store.example>"
+    message["To"] = "user@example.com"
+    message["Date"] = "Mon, 01 Jan 2024 12:00:00 +0000"
+    message.set_content("Plain text receipt")
+    message.add_alternative('<html><body><h1>Receipt</h1><img src="cid:logo"><script>alert(1)</script></body></html>', subtype="html")
+    html_part = message.get_payload()[-1]
+    html_part.add_related(b"fake-png-bytes", maintype="image", subtype="png", cid="<logo>")
+
+    result = analyze_email(message.as_bytes(), "visual-receipt.eml")
+
+    assert result["html_preview"]
+    assert "data:image/png;base64," in result["html_preview"]
+    assert "<script" not in result["html_preview"]
+    assert "alert(1)" not in result["html_preview"]
+
+
+def test_base64_encoded_plain_body_is_visible_in_inbox_preview():
+    encoded_body = base64.b64encode("This is the visible message body.".encode("utf-8"))
+    raw = (
+        b"From: Store <receipts@store.example>\r\n"
+        b"To: user@example.com\r\n"
+        b"Subject: Encoded receipt\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"Content-Transfer-Encoding: base64\r\n\r\n"
+        + encoded_body
+    )
+
+    result = analyze_email(raw, "encoded-receipt.eml")
+
+    assert "This is the visible message body." in result["html_preview"]

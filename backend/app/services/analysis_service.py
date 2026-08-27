@@ -1,9 +1,10 @@
-import hashlib, ipaddress, re, unicodedata, uuid
+import base64, hashlib, ipaddress, re, unicodedata, uuid
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from html import escape
+from html.parser import HTMLParser
 from urllib.parse import urlparse, unquote
 from .whois_service import get_whois
 
@@ -29,6 +30,11 @@ KNOWN_BRANDS = {
     "dropbox": {"domains": {"dropbox.com"}},
     "linkedin": {"domains": {"linkedin.com"}},
     "adobe": {"domains": {"adobe.com"}},
+        "mcafee": {"domains": {"mcafee.com"}},
+        "norton": {"domains": {"norton.com", "gen-digital.com"}},
+        "coinbase": {"domains": {"coinbase.com"}},
+        "ledger": {"domains": {"ledger.com"}},
+        "metamask": {"domains": {"metamask.io"}},
 }
 
 PHISHING_HINTS = (
@@ -70,12 +76,23 @@ MULTILINGUAL_PHISHING_HINTS = (
 MULTILINGUAL_SUSPICIOUS_TERMS = (
     "contraseña", "suspendida", "suspender", "inusual", "verifique", "inicie sesión", "llame", "mot de passe", "suspendu", "inhabituelle", "vérifiez", "connectez-vous", "appelez", "passwort", "gesperrt", "ungewöhnliche", "bestätigen", "anmelden", "anrufen", "senha", "suspensa", "incomum", "verifique", "faça login", "ligue", "password", "sospeso", "insolita", "verifica", "accedi", "chiama", "wachtwoord", "opgeschort", "ongebruikelijke", "bevestig", "log in", "bel", "كلمة المرور", "معلق", "غير معتاد", "تحقق", "سجل الدخول", "اتصل", "पासवर्ड", "निलंबित", "असामान्य", "सत्यापित", "लॉगिन", "कॉल", "密码", "暂停", "异常", "验证", "登录", "致电", "パスワード", "停止", "不審", "確認", "ログイン", "電話"
 )
+MULTILINGUAL_SUBJECT_TERMS = (
+    "atención", "alerta", "bloqueo", "bloqueada", "suspendida", "urgente", "seguridad", "verificación",
+    "attention", "alerte", "blocage", "bloqué", "suspendu", "urgent", "sécurité", "vérification",
+    "achtung", "warnung", "gesperrt", "sperrung", "dringend", "sicherheit", "bestätigung",
+    "atenção", "alerta", "bloqueada", "suspensa", "urgente", "segurança", "verificação",
+    "attenzione", "blocco", "bloccato", "sospeso", "urgente", "sicurezza", "verifica",
+    "let op", "waarschuwing", "geblokkeerd", "dringend", "beveiliging", "verificatie",
+    "تنبيه", "محظور", "معلق", "عاجل", "أمان", "تحقق", "चेतावनी", "अवरुद्ध", "निलंबित", "तत्काल", "सुरक्षा",
+    "警告", "已封锁", "暂停", "紧急", "安全", "验证", "警告", "停止", "緊急", "セキュリティ", "確認"
+)
 VISHING_CALL_TERMS = ("call", "phone", "telephone", "speak to", "contact our", "dial", "ring", "llame", "llamar", "llámenos", "appelez", "appeler", "telefonieren", "anrufen", "ligue", "ligar", "chiama", "bel", "اتصل", "कॉल", "कॉल करें", "立即致电", "今すぐ電話")
-VISHING_PRESSURE_TERMS = ("login", "log in", "sign in", "verify", "security", "account", "password", "mfa", "otp", "payment", "refund", "suspended", "locked", "unauthorized", "urgent", "immediately", "cuenta", "contraseña", "verifique", "suspendida", "activité", "mot de passe", "gesperrt", "passwort", "senha", "pagamento", "sospeso", "password", "оплата", "пароль", "аккаунт", "الحساب", "كلمة المرور", "खाता", "पासवर्ड", "密码", "账户", "パスワード", "アカウント")
+VISHING_PRESSURE_TERMS = ("login", "log in", "sign in", "verify", "security", "account", "password", "mfa", "otp", "payment", "refund", "suspended", "locked", "unauthorized", "urgent", "immediately", "subscription", "renewal", "expired", "antivirus", "virus", "malware", "wallet", "crypto", "cryptocurrency", "bitcoin", "ethereum", "seed phrase", "recovery phrase", "withdrawal", "transaction", "cuenta", "contraseña", "verifique", "suspendida", "activité", "mot de passe", "gesperrt", "passwort", "senha", "pagamento", "sospeso", "password", "оплата", "пароль", "аккаунт", "الحساب", "كلمة المرور", "खाता", "पासवर्ड", "密码", "账户", "パスワード", "アカウント")
 
 # A small public-suffix safeguard for common multi-label registrations.  A
 # production deployment should replace this with the Public Suffix List.
 MULTI_LABEL_SUFFIXES = {"co.uk", "org.uk", "ac.uk", "com.au", "net.au", "org.au", "co.in", "com.br", "co.jp", "co.nz", "com.mx", "com.sg"}
+TRUSTED_PUBLIC_SUFFIXES = (".gov", ".mil")
 CATEGORY_RULES = (
     ("ONE_TIME_PASSWORD", "One-time password", r"\b(?:otp|one[- ]time (?:passcode|code)|verification code|security code)\b"),
     ("SUBSCRIPTION", "Subscription & renewal", r"\b(?:subscription|renewal|renewed|billing cycle|membership|trial period|cancel subscription)\b"),
@@ -115,6 +132,42 @@ def _organizational_domain(domain):
     return ".".join(labels[-3:]) if suffix in MULTI_LABEL_SUFFIXES and len(labels) >= 3 else suffix
 def _same_organization(first, second):
     return bool(first and second and _organizational_domain(first) == _organizational_domain(second))
+
+def _is_trusted_public_domain(domain):
+    normalized = (domain or "").strip(".").lower()
+    return any(normalized.endswith(suffix) for suffix in TRUSTED_PUBLIC_SUFFIXES)
+
+def _domain_reliability(domain):
+    normalized = (domain or "").strip(".").lower()
+    signals = []
+    if not normalized:
+        return {"score": 0, "label": "Unknown", "signals": ["No sender domain was available"]}
+    score = 70
+    if not re.fullmatch(r"[a-z0-9.-]+", normalized) or "." not in normalized:
+        score -= 35
+        signals.append("Malformed or non-registrable sender domain")
+    if IP_RE.fullmatch(normalized):
+        score -= 45
+        signals.append("Sender uses an IP address instead of a domain")
+    if normalized.startswith("xn--") or ".xn--" in normalized:
+        score -= 30
+        signals.append("Punycode domain can conceal lookalike characters")
+    tld = normalized.rsplit(".", 1)[-1] if "." in normalized else ""
+    if tld in SUSPICIOUS_TLDS:
+        score -= 25
+        signals.append(f"High-abuse TLD: .{tld}")
+    if _is_trusted_public_domain(normalized):
+        score = max(score, 88)
+        signals.append("Recognized public-sector domain suffix")
+    if any(_organizational_domain(normalized) == domain_name for brand in KNOWN_BRANDS.values() for domain_name in brand["domains"]):
+        score = max(score, 84)
+        signals.append("Matches a known brand organization")
+    risky_tokens = ("verify", "secure", "support", "alert", "payment", "renewal", "recovery", "wallet", "login", "account")
+    if normalized.count("-") >= 2 and any(token in normalized for token in risky_tokens):
+        score -= 22
+        signals.append("Multiple separators and security-themed domain tokens")
+    label = "High" if score >= 75 else "Medium" if score >= 50 else "Low" if score >= 25 else "Very low"
+    return {"score": max(0, min(100, score)), "label": label, "signals": signals or ["No obvious structural domain warning"]}
 
 def _domain_relationship(sender_domain, reply_domain, subject, body):
     if not reply_domain: return {"verdict": "NO_REPLY_TO", "confidence": "high", "company_mentions": [], "matched_terms": [], "explanation": "No Reply-To address was present."}
@@ -168,6 +221,99 @@ def _received_chain(msg):
         })
     return hops
 def _safe_html(value): return escape(value or "")
+
+def _decode_text_part(part):
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        raw_payload = part.get_payload()
+        return raw_payload if isinstance(raw_payload, str) else ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except (LookupError, UnicodeError):
+        return payload.decode("utf-8", errors="replace")
+
+class _EmailPreviewSanitizer(HTMLParser):
+    allowed_tags = {"a", "article", "b", "blockquote", "br", "div", "em", "h1", "h2", "h3", "head", "hr", "i", "img", "li", "main", "ol", "p", "section", "small", "span", "strong", "table", "tbody", "td", "th", "thead", "title", "tr", "u", "ul"}
+    allowed_attributes = {"alt", "align", "height", "title", "width"}
+
+    def __init__(self, cid_images):
+        super().__init__(convert_charrefs=True)
+        self.cid_images = cid_images
+        self.output = []
+        self.ignored_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in {"embed", "form", "iframe", "object", "script", "style"}:
+            self.ignored_depth += 1
+            return
+        if self.ignored_depth:
+            return
+        if tag not in self.allowed_tags:
+            return
+        safe_attrs = []
+        for name, value in attrs:
+            name = name.lower()
+            value = value or ""
+            if tag == "img" and name == "src":
+                cid = value[4:].strip("<>") if value.lower().startswith("cid:") else ""
+                value = self.cid_images.get(cid, value)
+                if not (value.startswith("data:image/") or value.startswith("https://") or value.startswith("http://")):
+                    continue
+                safe_attrs.append(("src", value))
+            elif name in self.allowed_attributes:
+                safe_attrs.append((name, value))
+            elif tag == "a" and name == "href" and value.lower().startswith(("https://", "http://")):
+                safe_attrs.extend((("href", value), ("target", "_blank"), ("rel", "noopener noreferrer")))
+        rendered = "<" + tag + "".join(f' {name}="{escape(value, quote=True)}"' for name, value in safe_attrs) + ">"
+        self.output.append(rendered)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag.lower() in {"embed", "form", "iframe", "object", "script", "style"}:
+            self.ignored_depth = max(0, self.ignored_depth - 1)
+            return
+        if self.ignored_depth:
+            return
+        if tag.lower() in self.allowed_tags and tag.lower() not in {"br", "hr", "img"}:
+            self.output.append(f"</{tag.lower()}>")
+
+    def handle_data(self, data):
+        if self.ignored_depth:
+            return
+        self.output.append(escape(data))
+
+    def handle_comment(self, data):
+        return
+
+def _render_html_preview(msg, html_parts, plain_parts=None):
+    cid_images = {}
+    for part in msg.walk():
+        content_id = part.get("Content-ID")
+        payload = part.get_payload(decode=True)
+        if content_id and payload and part.get_content_maintype() == "image":
+            mime_type = part.get_content_type()
+            cid_images[str(content_id).strip("<>")] = f"data:{mime_type};base64,{base64.b64encode(payload).decode('ascii')}"
+    sanitizer = _EmailPreviewSanitizer(cid_images)
+    if html_parts:
+        sanitizer.feed("\n".join(html_parts))
+    elif plain_parts:
+        plain_text = "\n".join(plain_parts).strip()
+        cursor = 0
+        for match in URL_RE.finditer(plain_text):
+            sanitizer.handle_data(plain_text[cursor:match.start()])
+            url = match.group(0)
+            sanitizer.output.append(f'<a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{escape(url)}</a>')
+            cursor = match.end()
+        sanitizer.handle_data(plain_text[cursor:])
+        sanitizer.output.insert(0, '<div class="plain-message">')
+        sanitizer.output.append("</div>")
+    else:
+        return None
+    return """<!doctype html><html><head><meta charset="utf-8"><style>body{margin:0;padding:28px;background:#f5f7f8;color:#172126;font:15px Arial,sans-serif;line-height:1.55}main{max-width:760px;margin:auto;background:#fff;padding:28px;border:1px solid #dfe6e8}img{max-width:100%;height:auto}a{color:#147d68}table{max-width:100%;border-collapse:collapse}td,th{padding:6px;border:1px solid #dfe6e8}.plain-message{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body><main>""" + "".join(sanitizer.output) + "</main></body></html>"
 def _is_public_ip(ip):
     try: return ipaddress.ip_address(ip).is_global
     except ValueError: return False
@@ -213,24 +359,39 @@ def _phone_numbers(text):
 def _fold_text(text):
     return "".join(char for char in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(char))
 
-def _localized_phishing_hits(text):
+def _localized_phishing_hits(text, allow_single=False):
     lowered = (text or "").lower()
     folded = _fold_text(lowered)
     exact_hits = [hint for hint in MULTILINGUAL_PHISHING_HINTS if hint in lowered or _fold_text(hint) in folded]
     term_hits = [term for term in MULTILINGUAL_SUSPICIOUS_TERMS if term in lowered or _fold_text(term) in folded]
-    return list(dict.fromkeys(exact_hits + (term_hits if len(term_hits) >= 2 else [])))
+    single_hits = [term for term in MULTILINGUAL_SUBJECT_TERMS if term in lowered or _fold_text(term) in folded] if allow_single else []
+    return list(dict.fromkeys(exact_hits + (term_hits if len(term_hits) >= 2 else []) + single_hits))
 
 def _has_phishing_language(text):
     lowered = (text or "").lower()
     return any(hint in lowered for hint in PHISHING_HINTS) or bool(_localized_phishing_hits(lowered))
 
-def _looks_like_vishing(subject, body, raw_headers):
+def _suspicious_foreign_subject(subject):
+    hits = _localized_phishing_hits(subject, allow_single=True)
+    alert_format = bool(re.search(r"[!¡¿?:…]|\.\.\.", subject or ""))
+    return (hits and alert_format) or len(set(hits)) >= 2, hits
+
+def _looks_like_vishing(subject, body, raw_headers, sender_domain="", urls=None):
     text = f"{subject}\n{body}\n{raw_headers}".lower()
     numbers = _phone_numbers(f"{subject}\n{body}")
     call_terms = [term for term in VISHING_CALL_TERMS if re.search(rf"\b{re.escape(term)}\b", text)]
     pressure_terms = [term for term in VISHING_PRESSURE_TERMS if re.search(rf"\b{re.escape(term)}\b", text)]
     header_risk = bool(re.search(r"(?:authentication-results|received-spf):[^\n]*(?:fail|softfail|permerror)", text, re.I))
-    return numbers and call_terms and (pressure_terms or header_risk), numbers, call_terms, pressure_terms
+    brand_mismatch = any(
+        brand in text
+        and not any(_organizational_domain(sender_domain) == domain for domain in KNOWN_BRANDS[brand]["domains"])
+        for brand in KNOWN_BRANDS
+    )
+    external_link = any(
+        url.get("host") and not _same_organization(sender_domain, url.get("host", ""))
+        for url in (urls or [])
+    )
+    return numbers and call_terms and (pressure_terms or header_risk or brand_mismatch or external_link), numbers, call_terms, pressure_terms
 
 def _attachments(msg):
     items=[]
@@ -308,7 +469,7 @@ def _classification_categories(score, findings, urls, attachments, sender_domain
         categories.append("MALWARE")
     if any(u.get("risk_score", 0) >= 50 for u in urls):
         categories.append("SUSPICIOUS_URL")
-    if any(keyword in text for keyword in ["newsletter", "unsubscribe", "special offer", "limited time offer", "promotional", "bulk", "advertising"]):
+    if any(keyword in text for keyword in ["newsletter", "unsubscribe", "special offer", "limited time offer", "promotional", "bulk", "advertising"]) and not _is_trusted_public_domain(sender_domain):
         categories.append("SPAM")
     if any(keyword in text for keyword in ["keep this confidential", "urgent", "make a payment", "bank account change", "gift card", "vendor", "payroll", "invoice fraud"]):
         categories.append("BEC")
@@ -331,13 +492,17 @@ def _classification(score, findings, urls, attachments, sender_domain, subject, 
     brand_impersonation = _looks_like_brand_impersonation(sender_domain, subject, body, urls)
     risky_urls = any(u.get("risk_score", 0) >= 50 for u in urls)
     suspicious_sender = bool(sender_domain) and not any(domain in sender_domain.lower() for brand in KNOWN_BRANDS for domain in KNOWN_BRANDS[brand]["domains"]) and (brand_impersonation or phishing_signal)
+    trusted_public_origin = _is_trusted_public_domain(sender_domain)
 
     marketing_only = any(keyword in text for keyword in ["newsletter", "unsubscribe", "special offer", "limited time offer", "promotional", "bulk", "advertising", "sponsored", "discount", "coupon", "sale"]) and not any(hint in text for hint in ["password", "mfa", "otp", "security code", "verification code", "update your password", "verify your account", "login now", "payment failed", "update your payment", "wire transfer", "refund", "bank account", "gift card", "invoice payment failed", "suspended", "locked", "account compromised", "unauthorized login"]) and not any(f["title"] in {"Brand impersonation risk", "Sender identity mismatch", "Credential harvesting intent", "Financial-pressure narrative"} for f in findings)
 
     if marketing_only:
-        return "SPAM" if score >= 25 else "LEGITIMATE"
+        return "LEGITIMATE" if trusted_public_origin or score < 25 else "SPAM"
 
-    if "Voice-phishing (vishing) risk" in severe or "Credential harvesting intent" in severe or "Brand impersonation risk" in severe or "Financial-pressure narrative" in severe:
+    if trusted_public_origin and not severe and not risky_urls and not attachments and not phishing_signal and not brand_impersonation:
+        return "LEGITIMATE"
+
+    if "Voice-phishing (vishing) risk" in severe or "Foreign-language phishing subject" in severe or "Credential harvesting intent" in severe or "Brand impersonation risk" in severe or "Financial-pressure narrative" in severe:
         return "PHISHING"
     if suspicious_sender or brand_impersonation:
         return "PHISHING"
@@ -360,21 +525,22 @@ def analyze_email(raw: bytes, filename: str):
     plain, html = [], []
     for p in msg.walk():
         if p.get_content_disposition() == "attachment": continue
-        try:
-            if p.get_content_type() == "text/plain": plain.append(p.get_content())
-            elif p.get_content_type() == "text/html": html.append(p.get_content())
-        except Exception: pass
+        if p.get_content_type() == "text/plain": plain.append(_decode_text_part(p))
+        elif p.get_content_type() == "text/html": html.append(_decode_text_part(p))
     body = "\n".join(plain) + "\n" + "\n".join(html)
     sender, recipient, reply_to, return_path = _header(msg,"From"), _header(msg,"To"), _header(msg,"Reply-To"), _header(msg,"Return-Path")
     subject = _header(msg, "Subject") or "(No subject)"
     sender_domain, reply_domain = _domain(sender), _domain(reply_to)
+    sender_reliability = _domain_reliability(sender_domain)
     auth, urls, attachments = _auth(msg), _urls(body + "\n" + raw_headers), _attachments(msg)
-    vishing, phone_numbers, call_terms, pressure_terms = _looks_like_vishing(subject, body, raw_headers)
+    vishing, phone_numbers, call_terms, pressure_terms = _looks_like_vishing(subject, body, raw_headers, sender_domain, urls)
     message_category = _classify_message(subject, body, msg)
     findings=[]
     def finding(sev, title, description, evidence, recommendation): findings.append({"severity":sev,"title":title,"description":description,"evidence":evidence,"why_it_matters":description,"recommendation":recommendation})
     auth_fails = [name.upper() for name, data in auth.items() if data.get("status") == "FAIL"]
     if auth_fails: finding("HIGH", "Authentication failure", "One or more sender authentication controls failed.", ", ".join(auth_fails), "Verify the sender through an independent channel.")
+    if sender_reliability["score"] < 45:
+        finding("MEDIUM", "Low sender-domain reliability", "The visible sender domain has structural or naming characteristics commonly seen in disposable, lookalike, or abuse-prone infrastructure. This is supporting evidence, not proof of phishing by itself.", "; ".join(sender_reliability["signals"]), "Validate the sender using an independent official source before trusting links, payments, or account requests.")
     same_org_reply = _same_organization(sender_domain, reply_domain)
     domain_relationship = _domain_relationship(sender_domain, reply_domain, subject, f"{sender}\n{body}")
     if not vishing and phone_numbers and call_terms and (auth_fails or (reply_domain and sender_domain and not same_org_reply)):
@@ -395,6 +561,7 @@ def analyze_email(raw: bytes, filename: str):
     keyword_hits=[]
     normalized_body=body.lower()
     localized_hits = _localized_phishing_hits(f"{subject}\n{body}\n{raw_headers}")
+    foreign_subject_risk, foreign_subject_hits = _suspicious_foreign_subject(subject)
     threat_score = 0
     for key, (label, pattern) in KEYWORDS.items():
         hit = re.search(pattern, normalized_body)
@@ -406,6 +573,9 @@ def analyze_email(raw: bytes, filename: str):
     if localized_hits:
         threat_score += 12
         finding("HIGH", "Suspicious language in message", "The email contains translated or non-English account, security, payment, or call-to-action language associated with phishing. Language alone is evaluated together with headers, links, and other evidence.", ", ".join(localized_hits[:8]), "Verify the sender and any requested action through an official channel; do not use contact details or links supplied by the message.")
+    if foreign_subject_risk:
+        threat_score += 15
+        finding("HIGH", "Foreign-language phishing subject", "The subject contains localized blocking, alert, security, or verification language in an urgent format. This is treated as a strong indicator when evaluated with sender identity, authentication, links, and message content.", ", ".join(foreign_subject_hits[:8]), "Verify the message through the organization's official website instead of using links or contact details in the email.")
     if _looks_like_brand_impersonation(sender_domain, subject, body, urls):
         threat_score += 18
         finding("HIGH", "Brand impersonation risk", "The email references a known brand but the sender and destination context do not align with that brand's legitimate infrastructure.", f"Brand mentions: {', '.join(_extract_brand_mentions(subject, body))}; sender domain: {sender_domain}", "Verify the sender through a trusted official channel and do not click account-related links.")
@@ -420,6 +590,7 @@ def analyze_email(raw: bytes, filename: str):
         finding("HIGH", "Voice-phishing (vishing) risk", "The message directs the recipient to call a phone number while discussing account, login, security, or payment action. This combination is a common voice-phishing pattern.", f"Phone number(s): {', '.join(phone_numbers)}; call language: {', '.join(call_terms)}; suspicious context: {', '.join(pressure_terms)}", "Do not call the number in the email. Use the organization's official website or a trusted statement to find its phone number.")
     if "<script" in body.lower() or "javascript:" in body.lower(): finding("HIGH", "Active content in HTML", "HTML contains JavaScript-like active content.", "script/javascript URI detected", "Do not render this HTML outside a sandbox.")
     received_chain = _received_chain(msg)
+    html_preview = _render_html_preview(msg, html, plain)
     received_ips = list(dict.fromkeys(ip for ip in IP_RE.findall(raw_headers) if _is_public_ip(ip)))
     if received_ips: ips=[{"ip":ip,"reverse_dns":"Not queried","reputation":"Unknown / no intelligence available","is_public":True} for ip in received_ips]
     else: ips=[]
@@ -431,6 +602,7 @@ def analyze_email(raw: bytes, filename: str):
     category("Attachments",10,min(10,sum(8 for a in attachments if a["signals"])))
     category("Content",15, min(15, threat_score))
     category("Infrastructure",10,3 if received_ips else 0)
+    category("Domain Reliability",10, max(0, round((70 - sender_reliability["score"]) / 7)))
     category("Threat Intelligence",10,0)
     score=min(100,sum(x["score"] for x in score_breakdown))
 
@@ -463,8 +635,9 @@ def analyze_email(raw: bytes, filename: str):
             whois_signals = [f"Registrar: {whois.get('registrar', 'Unknown')}", f"Registrant: {whois.get('registrant', 'Unknown')}", f"Expires: {whois.get('expiry_date', 'Unknown')}"]
             if whois.get("nameservers"): whois_signals.append(f"Nameservers: {', '.join(whois['nameservers'][:3])}")
         if domain.startswith("xn--"): whois_signals.insert(0, "Punycode domain")
-        domain_data.append({"domain":domain,"role":"Sender" if domain==sender_domain else "Referenced","age":f"Created: {whois.get('created_date', 'Unknown')}","dns":"WHOIS available" if whois.get("status") == "available" else "Not queried","reputation":"WHOIS data available" if whois.get("status") == "available" else "Unknown / no intelligence available","signals":whois_signals,"whois":whois})
+        reliability = _domain_reliability(domain)
+        domain_data.append({"domain":domain,"role":"Sender" if domain==sender_domain else "Referenced","age":f"Created: {whois.get('created_date', 'Unknown')}","dns":"WHOIS available" if whois.get("status") == "available" else "Not queried","reputation":"WHOIS data available" if whois.get("status") == "available" else "Unknown / no intelligence available","reliability_score":reliability["score"],"reliability":reliability["label"],"signals":list(dict.fromkeys(reliability["signals"] + whois_signals)),"whois":whois})
     all_addresses=[a for _,a in getaddresses([sender,recipient,reply_to,return_path])]
     timeline=[{"time":datetime.now(timezone.utc).strftime("%H:%M:%S"),"event":"Sample parsed in memory"},{"time":"+00:01","event":"Headers, MIME parts, URLs and attachments extracted"},{"time":"+00:02","event":"Authentication and weighted risk engine completed"},{"time":"+00:02","event":f"Classification: {classification}"}]
     explanation = f"This email is classified as {classification}. " + (findings[0]["description"] if findings else "No high-confidence suspicious signals were identified from the available message data.")
-    return {"id":str(uuid.uuid4()),"email_metadata":{"filename":filename,"subject":subject,"sender":sender or "Unknown","recipient":recipient or "Unknown","date":_header(msg,"Date") or "Unknown","reply_to":reply_to or "Not set","return_path":return_path or "Not set","message_id":_header(msg,"Message-ID") or "Not set","size":len(raw),"mime_type":msg.get_content_type(),"url_count":len(urls),"attachment_count":len(attachments),"sender_domain":sender_domain or "Unknown","sending_ip":received_ips[0] if received_ips else "Unknown"},"classification":classification,"categories":categories,"confidence":confidence,"message_category":message_category,"domain_relationship":domain_relationship,"verdict_explanation":explanation,"risk_score":score,"risk_level":level,"score_breakdown":score_breakdown,"authentication":auth,"headers":headers,"received_chain":received_chain,"domains":domain_data,"ips":ips,"urls":urls,"attachments":attachments,"content_analysis":{"social_engineering_indicators":keyword_hits,"vishing_numbers":phone_numbers,"html_detected":bool(html),"javascript_detected":"<script" in body.lower() or "javascript:" in body.lower(),"tracking_pixels":len(re.findall(r"<img[^>]+(?:width=[\"']?1|height=[\"']?1)", body, re.I)),"preview_text":_safe_html("\n".join(plain)[:3000])},"threat_intelligence":{"status":"No external intelligence provider configured","note":"Missing API data is not treated as clean."},"findings":findings,"indicators":{"emails":list(dict.fromkeys(all_addresses)),"domains":domains,"ips":received_ips,"urls":[u["normalized"] for u in urls],"phone_numbers":phone_numbers,"hashes":[a["sha256"] for a in attachments],"message_ids":[_header(msg,"Message-ID")] if _header(msg,"Message-ID") else []},"recommendations":[f["recommendation"] for f in findings if f["severity"] != "INFO"] or ["No immediate action. Retain the original sample if further verification is needed."],"timeline":timeline,"raw_headers":raw_headers,"html_preview":None}
+    return {"id":str(uuid.uuid4()),"email_metadata":{"filename":filename,"subject":subject,"sender":sender or "Unknown","recipient":recipient or "Unknown","date":_header(msg,"Date") or "Unknown","reply_to":reply_to or "Not set","return_path":return_path or "Not set","message_id":_header(msg,"Message-ID") or "Not set","size":len(raw),"mime_type":msg.get_content_type(),"url_count":len(urls),"attachment_count":len(attachments),"sender_domain":sender_domain or "Unknown","sending_ip":received_ips[0] if received_ips else "Unknown"},"classification":classification,"categories":categories,"confidence":confidence,"message_category":message_category,"domain_relationship":domain_relationship,"verdict_explanation":explanation,"risk_score":score,"risk_level":level,"score_breakdown":score_breakdown,"authentication":auth,"headers":headers,"received_chain":received_chain,"domains":domain_data,"ips":ips,"urls":urls,"attachments":attachments,"content_analysis":{"social_engineering_indicators":keyword_hits,"vishing_numbers":phone_numbers,"html_detected":bool(html),"javascript_detected":"<script" in body.lower() or "javascript:" in body.lower(),"tracking_pixels":len(re.findall(r"<img[^>]+(?:width=[\"']?1|height=[\"']?1)", body, re.I)),"preview_text":_safe_html("\n".join(plain)[:3000])},"threat_intelligence":{"status":"No external intelligence provider configured","note":"Missing API data is not treated as clean."},"findings":findings,"indicators":{"emails":list(dict.fromkeys(all_addresses)),"domains":domains,"ips":received_ips,"urls":[u["normalized"] for u in urls],"phone_numbers":phone_numbers,"hashes":[a["sha256"] for a in attachments],"message_ids":[_header(msg,"Message-ID")] if _header(msg,"Message-ID") else []},"recommendations":[f["recommendation"] for f in findings if f["severity"] != "INFO"] or ["No immediate action. Retain the original sample if further verification is needed."],"timeline":timeline,"raw_headers":raw_headers,"html_preview":html_preview}
