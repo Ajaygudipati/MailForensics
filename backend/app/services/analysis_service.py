@@ -9,7 +9,7 @@ from .whois_service import get_whois
 
 URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"']+")
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-PHONE_RE = re.compile(r"(?<![\w])(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)\d{3,4}[\s.-]\d{3,4}(?!\w)")
+PHONE_RE = re.compile(r"(?<![\w])(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)(?:\d[\s.-]?){6,13}\d(?!\w)")
 SUSPICIOUS_TLDS = {"zip", "top", "xyz", "click", "gq", "work", "country", "icu", "sbs"}
 SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "rb.gy", "is.gd"}
 KEYWORDS = {
@@ -67,8 +67,11 @@ MULTILINGUAL_PHISHING_HINTS = (
     # Chinese and Japanese
     "验证您的密码", "登录您的账户", "账户已暂停", "异常活动", "更新付款信息", "立即致电", "パスワードを確認", "ログインしてください", "アカウントが停止", "不審なアクティビティ", "支払い情報を更新", "今すぐ電話",
 )
-VISHING_CALL_TERMS = ("call", "phone", "telephone", "speak to", "contact our", "dial", "ring")
-VISHING_PRESSURE_TERMS = ("login", "log in", "sign in", "verify", "security", "account", "password", "mfa", "otp", "payment", "refund", "suspended", "locked", "unauthorized", "urgent", "immediately")
+MULTILINGUAL_SUSPICIOUS_TERMS = (
+    "contraseña", "suspendida", "suspender", "inusual", "verifique", "inicie sesión", "llame", "mot de passe", "suspendu", "inhabituelle", "vérifiez", "connectez-vous", "appelez", "passwort", "gesperrt", "ungewöhnliche", "bestätigen", "anmelden", "anrufen", "senha", "suspensa", "incomum", "verifique", "faça login", "ligue", "password", "sospeso", "insolita", "verifica", "accedi", "chiama", "wachtwoord", "opgeschort", "ongebruikelijke", "bevestig", "log in", "bel", "كلمة المرور", "معلق", "غير معتاد", "تحقق", "سجل الدخول", "اتصل", "पासवर्ड", "निलंबित", "असामान्य", "सत्यापित", "लॉगिन", "कॉल", "密码", "暂停", "异常", "验证", "登录", "致电", "パスワード", "停止", "不審", "確認", "ログイン", "電話"
+)
+VISHING_CALL_TERMS = ("call", "phone", "telephone", "speak to", "contact our", "dial", "ring", "llame", "llamar", "llámenos", "appelez", "appeler", "telefonieren", "anrufen", "ligue", "ligar", "chiama", "bel", "اتصل", "कॉल", "कॉल करें", "立即致电", "今すぐ電話")
+VISHING_PRESSURE_TERMS = ("login", "log in", "sign in", "verify", "security", "account", "password", "mfa", "otp", "payment", "refund", "suspended", "locked", "unauthorized", "urgent", "immediately", "cuenta", "contraseña", "verifique", "suspendida", "activité", "mot de passe", "gesperrt", "passwort", "senha", "pagamento", "sospeso", "password", "оплата", "пароль", "аккаунт", "الحساب", "كلمة المرور", "खाता", "पासवर्ड", "密码", "账户", "パスワード", "アカウント")
 
 # A small public-suffix safeguard for common multi-label registrations.  A
 # production deployment should replace this with the Public Suffix List.
@@ -213,7 +216,9 @@ def _fold_text(text):
 def _localized_phishing_hits(text):
     lowered = (text or "").lower()
     folded = _fold_text(lowered)
-    return [hint for hint in MULTILINGUAL_PHISHING_HINTS if hint in lowered or _fold_text(hint) in folded]
+    exact_hits = [hint for hint in MULTILINGUAL_PHISHING_HINTS if hint in lowered or _fold_text(hint) in folded]
+    term_hits = [term for term in MULTILINGUAL_SUSPICIOUS_TERMS if term in lowered or _fold_text(term) in folded]
+    return list(dict.fromkeys(exact_hits + (term_hits if len(term_hits) >= 2 else [])))
 
 def _has_phishing_language(text):
     lowered = (text or "").lower()
@@ -224,7 +229,8 @@ def _looks_like_vishing(subject, body, raw_headers):
     numbers = _phone_numbers(f"{subject}\n{body}")
     call_terms = [term for term in VISHING_CALL_TERMS if re.search(rf"\b{re.escape(term)}\b", text)]
     pressure_terms = [term for term in VISHING_PRESSURE_TERMS if re.search(rf"\b{re.escape(term)}\b", text)]
-    return numbers and call_terms and pressure_terms, numbers, call_terms, pressure_terms
+    header_risk = bool(re.search(r"(?:authentication-results|received-spf):[^\n]*(?:fail|softfail|permerror)", text, re.I))
+    return numbers and call_terms and (pressure_terms or header_risk), numbers, call_terms, pressure_terms
 
 def _attachments(msg):
     items=[]
@@ -371,6 +377,8 @@ def analyze_email(raw: bytes, filename: str):
     if auth_fails: finding("HIGH", "Authentication failure", "One or more sender authentication controls failed.", ", ".join(auth_fails), "Verify the sender through an independent channel.")
     same_org_reply = _same_organization(sender_domain, reply_domain)
     domain_relationship = _domain_relationship(sender_domain, reply_domain, subject, f"{sender}\n{body}")
+    if not vishing and phone_numbers and call_terms and (auth_fails or (reply_domain and sender_domain and not same_org_reply)):
+        vishing = True
     if reply_domain and sender_domain and not same_org_reply:
         if domain_relationship["verdict"] == "CONTEXTUALLY_ALIGNED":
             finding("INFO", "Contextually aligned intermediate domain", "Reply-To uses a different company domain, but the message body contains matching company language. This can indicate a legitimate MTA, recruiting, CRM, or notification relay.", f"From: {sender_domain}; Reply-To: {reply_domain}; matched terms: {', '.join(domain_relationship['matched_terms'])}", "Confirm the relationship with authentication results and the observed mail path before trusting the message.")

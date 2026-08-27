@@ -129,3 +129,35 @@ def test_spanish_promotion_is_not_phishing_without_security_pressure():
     result = analyze_email(raw, "spanish-promotion.eml")
 
     assert result["classification"] != "PHISHING"
+
+
+def test_foreign_language_vishing_with_international_number_is_phishing():
+    raw = make_email(
+        "Votre compte est suspendu - appelez maintenant",
+        "Service de sécurité <alert@secure-account.example>",
+        "Nous avons détecté une activité inhabituelle. Vérifiez votre mot de passe et appelez le +33 1 23 45 67 89 immédiatement pour réactiver votre compte.",
+    )
+
+    result = analyze_email(raw, "french-vishing.eml")
+
+    assert result["classification"] == "PHISHING"
+    assert "VISHING" in result["categories"]
+    assert any(f["title"] == "Suspicious language in message" for f in result["findings"])
+    assert any("33" in number and "23" in number for number in result["indicators"]["phone_numbers"])
+
+
+def test_authentication_failure_and_call_target_escalate_sparse_message():
+    raw = make_email(
+        "Security notice",
+        "Security Desk <notice@untrusted.example>",
+        "Call 020 7946 0958 now about your account.",
+    )
+    raw = raw.replace(
+        b"Date: Mon, 01 Jan 2024 12:00:00 +0000",
+        b"Date: Mon, 01 Jan 2024 12:00:00 +0000\nAuthentication-Results: mx.example; spf=fail; dkim=fail; dmarc=fail",
+    )
+
+    result = analyze_email(raw, "header-vishing.eml")
+
+    assert result["classification"] == "PHISHING"
+    assert "VISHING" in result["categories"]
