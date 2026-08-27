@@ -79,9 +79,7 @@ function Header({ onReset }: { onReset?: () => void }) {
         onClick={onReset}
         aria-label="MailForensics home"
       >
-        <span className="mark">
-          <ShieldCheck size={17} />
-        </span>
+        <img className="brand-mark" src="/mailforensics-mark.svg" alt="" />
         <span>
           Mail<span>Forensics</span>
         </span>
@@ -782,7 +780,23 @@ function SignalDetails({ analysis }: { analysis: Analysis }) {
             <span>Tracking pixels</span>
             <b>{content.tracking_pixels || 0}</b>
           </div>
+          <div>
+            <span>Phone numbers</span>
+            <Badge tone={content.vishing_numbers?.length ? "high" : "pass"}>
+              {content.vishing_numbers?.length || 0}
+            </Badge>
+          </div>
         </div>
+        {content.vishing_numbers?.length ? (
+          <div className="phone-alert">
+            <span className="micro">CALL TARGETS DETECTED</span>
+            <div>
+              {content.vishing_numbers.map((number: string) => (
+                <mark key={number}>{number}</mark>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <p className="content-preview">
           {content.preview_text || "No readable plain-text preview available."}
         </p>
@@ -966,6 +980,11 @@ export default function AppShell() {
       <Header />
       <main className="landing">
         <div className="landing-copy">
+          <img
+            className="landing-mark"
+            src="/mailforensics-mark.svg"
+            alt="MailForensics"
+          />
           <span className="micro">
             <Radar size={14} /> EMAIL THREAT INVESTIGATION
           </span>

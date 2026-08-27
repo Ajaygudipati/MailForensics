@@ -9,7 +9,7 @@ def make_email(subject, sender, body, recipient="user@example.com") -> bytes:
     msg["From"] = sender
     msg["To"] = recipient
     msg["Date"] = "Mon, 01 Jan 2024 12:00:00 +0000"
-    msg.set_payload(body)
+    msg.set_content(body)
     return msg.as_bytes()
 
 
@@ -75,4 +75,57 @@ def test_promotion_email_with_brand_mention_is_not_phishing_by_default():
     result = analyze_email(raw, "promo.eml")
 
     assert result["message_category"]["code"] in {"ADVERTISEMENT", "MARKETING_NEWSLETTER"}
+    assert result["classification"] != "PHISHING"
+
+
+def test_vishing_email_with_phone_and_login_pressure_is_phishing():
+    raw = make_email(
+        "Urgent security alert - call now",
+        "Account Support <support@account-alerts.example>",
+        "Your account is locked due to unusual activity. Call +1 (800) 555-0199 immediately and provide the verification code to restore your login.",
+    )
+
+    result = analyze_email(raw, "vishing.eml")
+
+    assert result["classification"] == "PHISHING"
+    assert "VISHING" in result["categories"]
+    assert "+1 (800) 555-0199" in result["indicators"]["phone_numbers"]
+    assert any(f["title"] == "Voice-phishing (vishing) risk" for f in result["findings"])
+
+
+def test_phone_number_without_suspicious_call_context_is_not_vishing():
+    raw = make_email(
+        "Your order receipt",
+        "Store Receipts <receipts@store.example>",
+        "Thank you for your purchase. For general customer service, our published contact number is 800-555-0199. Your receipt is attached.",
+    )
+
+    result = analyze_email(raw, "receipt.eml")
+
+    assert "VISHING" not in result["categories"]
+    assert not any(f["title"] == "Voice-phishing (vishing) risk" for f in result["findings"])
+
+
+def test_spanish_phishing_language_is_detected():
+    raw = make_email(
+        "Su cuenta está suspendida",
+        "Seguridad <alertas@account-check.example>",
+        "Detectamos actividad inusual. Verifique su contraseña e inicie sesión inmediatamente en https://account-check.example/login.",
+    )
+
+    result = analyze_email(raw, "spanish-phishing.eml")
+
+    assert result["classification"] == "PHISHING"
+    assert any(f["title"] == "Suspicious language in message" for f in result["findings"])
+
+
+def test_spanish_promotion_is_not_phishing_without_security_pressure():
+    raw = make_email(
+        "Oferta especial de Adobe",
+        "Noticias <offers@newsletter.example>",
+        "Ahorra 40% con nuestra oferta especial y descubre nuevos productos. Visita https://newsletter.example/oferta.",
+    )
+
+    result = analyze_email(raw, "spanish-promotion.eml")
+
     assert result["classification"] != "PHISHING"
