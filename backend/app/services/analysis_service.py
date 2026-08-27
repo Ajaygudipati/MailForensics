@@ -201,19 +201,30 @@ def _extract_brand_mentions(subject: str, body: str):
 def _looks_like_brand_impersonation(sender_domain: str, subject: str, body: str, urls: list[dict]):
     sender = (sender_domain or "").lower()
     text = f"{subject}\n{body}".lower()
-    for brand, meta in KNOWN_BRANDS.items():
-        brand_domains = meta["domains"]
-        if any(brand_domain in sender for brand_domain in brand_domains):
-            return False
-        if brand in text and not any(domain in sender for domain in brand_domains):
+    mentioned_brands = [brand for brand in KNOWN_BRANDS if brand in text]
+    if not mentioned_brands:
+        return False
+
+    marketing_only = any(keyword in text for keyword in ["newsletter", "unsubscribe", "special offer", "limited time offer", "promotional", "bulk", "advertising", "sponsored", "discount", "coupon", "sale"]) and not any(token in text for token in ["password", "mfa", "otp", "security code", "verification code", "update your password", "verify your account", "login now", "payment failed", "update your payment", "wire transfer", "refund", "bank account", "gift card", "invoice payment failed", "suspended", "locked", "account compromised", "unauthorized login"]) 
+    if marketing_only:
+        return False
+
+    for brand in mentioned_brands:
+        brand_domains = KNOWN_BRANDS[brand]["domains"]
+        sender_matches_brand = any(domain in sender for domain in brand_domains)
+        if sender_matches_brand:
+            continue
+
+        external_urls = [
+            url for url in urls
+            if (url.get("host") or "").lower() and not any(domain in (url.get("host") or "").lower() for domain in brand_domains)
+        ]
+        if external_urls:
             return True
-    for url in urls:
-        host = (url.get("host") or "").lower()
-        for brand, meta in KNOWN_BRANDS.items():
-            if brand in host:
-                continue
-            if brand in (subject + " " + body).lower() and url.get("risk_score", 0) >= 50:
-                return True
+
+        if any(phrase in text for phrase in ["verify your password", "mfa code", "security code", "update your payment", "login now", "account suspended"]):
+            return True
+
     return False
 
 
@@ -221,11 +232,16 @@ def _classification_categories(score, findings, urls, attachments, sender_domain
     text = f"{subject}\n{body}".lower()
     categories = []
 
+    marketing_signals = any(keyword in text for keyword in ["newsletter", "unsubscribe", "special offer", "limited time offer", "promotional", "bulk", "advertising", "sponsored", "discount", "coupon", "sale"])
+    if marketing_signals:
+        categories.append("MARKETING")
+
     if any(title in {"Brand impersonation risk", "Sender identity mismatch"} for title in [f["title"] for f in findings]):
         categories.append("BRAND_IMPERSONATION")
-    if any(keyword in text for keyword in ["password", "mfa", "otp", "verify your account", "security code", "verification code", "update your password", "login now"]):
+    branded_sender = bool(sender_domain) and any(brand_name in (subject + " " + body).lower() for brand_name in KNOWN_BRANDS)
+    if any(keyword in text for keyword in ["password", "mfa", "otp", "verify your account", "security code", "verification code", "update your password", "login now"]) and branded_sender:
         categories.append("CREDENTIAL_PHISHING")
-    if any(keyword in text for keyword in ["payment failed", "update your payment", "bank account", "wire transfer", "invoice payment failed", "gift card", "refund"]):
+    if any(keyword in text for keyword in ["payment failed", "update your payment", "bank account", "wire transfer", "invoice payment failed", "gift card", "refund"]) and branded_sender:
         categories.append("PAYMENT_PHISHING")
     if any(keyword in text for keyword in ["suspended", "security alert", "unusual activity", "account compromised", "locked", "unauthorized login"]):
         categories.append("ACCOUNT_COMPROMISE")
@@ -256,6 +272,11 @@ def _classification(score, findings, urls, attachments, sender_domain, subject, 
     brand_impersonation = _looks_like_brand_impersonation(sender_domain, subject, body, urls)
     risky_urls = any(u.get("risk_score", 0) >= 50 for u in urls)
     suspicious_sender = bool(sender_domain) and not any(domain in sender_domain.lower() for brand in KNOWN_BRANDS for domain in KNOWN_BRANDS[brand]["domains"]) and (brand_impersonation or phishing_signal)
+
+    marketing_only = any(keyword in text for keyword in ["newsletter", "unsubscribe", "special offer", "limited time offer", "promotional", "bulk", "advertising", "sponsored", "discount", "coupon", "sale"]) and not any(hint in text for hint in ["password", "mfa", "otp", "security code", "verification code", "update your password", "verify your account", "login now", "payment failed", "update your payment", "wire transfer", "refund", "bank account", "gift card", "invoice payment failed", "suspended", "locked", "account compromised", "unauthorized login"]) and not any(f["title"] in {"Brand impersonation risk", "Sender identity mismatch", "Credential harvesting intent", "Financial-pressure narrative"} for f in findings)
+
+    if marketing_only:
+        return "SPAM" if score >= 25 else "LEGITIMATE"
 
     if "Credential harvesting intent" in severe or "Brand impersonation risk" in severe or "Financial-pressure narrative" in severe:
         return "PHISHING"
